@@ -85,6 +85,7 @@ class BaseDataset(Dataset):
         classes: list[int] | None = None,
         fraction: float = 1.0,
         channels: int = 3,
+        frame_range: str = "",  # [NEW] 支持多帧时序加载，例如 "1-10" 或 "3-7"
     ):
         """Initialize BaseDataset with given configuration and options.
 
@@ -106,6 +107,7 @@ class BaseDataset(Dataset):
                 OpenCV are in BGR channel order.
         """
         super().__init__()
+        self.frame_range = frame_range  # [NEW] 保存多帧配置范围
         self.img_path = img_path
         self.imgsz = imgsz
         self.augment = augment
@@ -113,9 +115,9 @@ class BaseDataset(Dataset):
         self.prefix = prefix
         self.fraction = fraction
         self.channels = channels
-        self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
-        self.im_files = self.get_img_files(self.img_path)
-        self.labels = self.get_labels()
+        self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR #根据通道数设置 OpenCV 读取标志 cv2_flag
+        self.im_files = self.get_img_files(self.img_path)  #获取图像文件列表
+        self.labels = self.get_labels()  # 加载标签
         self.update_labels(include_class=classes)  # single_cls and include_class
         self.ni = len(self.labels)  # number of images
         self.rect = rect
@@ -146,6 +148,80 @@ class BaseDataset(Dataset):
 
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
+
+        # ==================== [NEW] 多帧样本重组逻辑 ====================
+        if self.frame_range:
+            self._build_multiframe()
+            # 重组完数据集（self.ni 减少）后，再进行矩形计算
+            if self.rect:
+                assert self.batch_size is not None
+                self.set_rectangle()
+        # ================================================================
+
+    # [NEW] 新增方法：负责将离散的单帧整合为时序样本群
+    def _build_multiframe(self):
+        """Reconstruct dataset for multi-frame loading."""
+        start_f, end_f = map(int, self.frame_range.split('-'))
+
+        new_labels, new_im_files, new_npy_files = [], [], []
+        new_ims, new_im_hw0, new_im_hw = [], [], []
+        self.multiframe_data = []
+
+        # 1. 根据文件名对数据进行分组 (seq_XXXX)
+        seq_dict = {}
+        for idx, f in enumerate(self.im_files):
+            # 匹配 seq_XXXX_frame_YY 模式
+            match = re.search(r'(seq_\d+)_frame_(\d+)', Path(f).name)
+            if match:
+                seq, f_num = match.group(1), int(match.group(2))
+                if seq not in seq_dict:
+                    seq_dict[seq] = []
+                seq_dict[seq].append((f_num, idx))
+
+        # 2. 遍历分组，提取多帧与 Anchor (最后一帧)
+        for seq in sorted(seq_dict.keys()):
+            frames = seq_dict[seq]
+            frames.sort(key=lambda x: x[0])  # 确保按帧号升序
+
+            # 过滤出所需范围内的帧，如 3 到 7
+            target_frames = [x for x in frames if start_f <= x[0] <= end_f]
+            if not target_frames:
+                continue
+
+            # Anchor 取最后要求的帧 (end_f)
+            anchor = next((x for x in target_frames if x[0] == end_f), None)
+            if not anchor:
+                anchor = target_frames[-1]  # Fallback
+
+            anchor_idx = anchor[1]
+
+            # 3. 将原列表中关于 Anchor 的信息推入新列表，代表这个“样本”
+            new_labels.append(self.labels[anchor_idx])
+            new_im_files.append(self.im_files[anchor_idx])
+            new_npy_files.append(self.npy_files[anchor_idx])
+            new_ims.append(self.ims[anchor_idx] if self.ims else None)
+            new_im_hw0.append(self.im_hw0[anchor_idx] if self.im_hw0 else None)
+            new_im_hw.append(self.im_hw[anchor_idx] if self.im_hw else None)
+
+            # 4. 保存此时序样本对应的所有历史帧索引与缓存，供 load_image 调用
+            mf_imgs, mf_files, mf_npys, mf_hw0, mf_hw = [], [], [], [], []
+            for f_num, f_idx in target_frames:
+                mf_imgs.append(self.ims[f_idx] if self.ims else None)
+                mf_files.append(self.im_files[f_idx])
+                mf_npys.append(self.npy_files[f_idx])
+                mf_hw0.append(self.im_hw0[f_idx] if self.im_hw0 else None)
+                mf_hw.append(self.im_hw[f_idx] if self.im_hw else None)
+
+            self.multiframe_data.append({
+                'ims': mf_imgs, 'files': mf_files, 'npys': mf_npys,
+                'hw0': mf_hw0, 'hw': mf_hw
+            })
+
+        # 5. 覆盖类属性，YOLO 引擎现在会认为这就是一个普通的单样本数据集
+        self.labels, self.im_files, self.npy_files = new_labels, new_im_files, new_npy_files
+        self.ims, self.im_hw0, self.im_hw = new_ims, new_im_hw0, new_im_hw
+        self.ni = len(self.labels)
+        self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
         """Read image files from the specified path.
@@ -390,7 +466,52 @@ class BaseDataset(Dataset):
         """
         label = deepcopy(self.labels[index])  # requires deepcopy() https://github.com/ultralytics/ultralytics/pull/1948
         label.pop("shape", None)  # shape is for rect, remove it
+
         label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(index)
+
+        # ==================== [NEW] 读取多帧并沿通道维度拼接 ====================
+        if not getattr(self, "frame_range", ""):
+            # 兼容原版单帧逻辑
+            label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(index)
+        else:
+            imgs = []
+            mf_data = self.multiframe_data[index]
+            ori_shape, resized_shape = None, None
+
+            # 暂存当前 Anchor 索引处的缓存状态
+            orig_im, orig_file, orig_npy = self.ims[index], self.im_files[index], self.npy_files[index]
+            orig_hw0, orig_hw = self.im_hw0[index], self.im_hw[index]
+
+            for i_frame in range(len(mf_data['files'])):
+                # 动态替换缓存指针，欺骗 load_image，使其能复用原版的 Resize 和 Cache 逻辑
+                self.ims[index] = mf_data['ims'][i_frame]
+                self.im_files[index] = mf_data['files'][i_frame]
+                self.npy_files[index] = mf_data['npys'][i_frame]
+                self.im_hw0[index] = mf_data['hw0'][i_frame]
+                self.im_hw[index] = mf_data['hw'][i_frame]
+
+                # 调用原版 load_image
+                img, o_shape, r_shape = self.load_image(index)
+                
+                # 同步可能被 load_image 触发生成的 Resize 内存缓存
+                mf_data['ims'][i_frame] = self.ims[index]
+                mf_data['hw0'][i_frame] = self.im_hw0[index]
+                mf_data['hw'][i_frame] = self.im_hw[index]
+
+                imgs.append(img)
+                # 形状以最后一帧为准
+                ori_shape, resized_shape = o_shape, r_shape
+
+            # 恢复 Anchor 缓存状态
+            self.ims[index], self.im_files[index], self.npy_files[index] = orig_im, orig_file, orig_npy
+            self.im_hw0[index], self.im_hw[index] = orig_hw0, orig_hw
+
+            # 沿通道合并张量。例如: 5张(H,W,3)的图拼接为(H,W,15)
+            label["img"] = np.concatenate(imgs, axis=-1)
+            label["ori_shape"] = ori_shape
+            label["resized_shape"] = resized_shape
+        # ========================================================================
+
         label["ratio_pad"] = (
             label["resized_shape"][0] / label["ori_shape"][0],
             label["resized_shape"][1] / label["ori_shape"][1],
