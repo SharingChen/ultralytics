@@ -85,6 +85,13 @@ class YOLODataset(BaseDataset):
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+
+        # ==================== [NEW] 拦截并注入自定义参数 ====================
+        # 从 data.yaml 字典中提取 frame_range，并注入到传给父类的 kwargs 中
+        if self.data and "frame_range" in self.data:
+            kwargs["frame_range"] = self.data["frame_range"]
+        # ====================================================================
+
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
